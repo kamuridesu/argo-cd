@@ -25,6 +25,8 @@ import (
 
 	// nolint:staticcheck
 	golang_proto "github.com/golang/protobuf/proto"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 
 	"github.com/argoproj/notifications-engine/pkg/api"
 	"github.com/argoproj/pkg/sync"
@@ -161,7 +163,7 @@ func init() {
 	if replicasCount > 0 {
 		maxConcurrentLoginRequestsCount = maxConcurrentLoginRequestsCount / replicasCount
 	}
-	enableGRPCTimeHistogram = os.Getenv(common.EnvEnableGRPCTimeHistogramEnv) == "true"
+	enableGRPCTimeHistogram = env.ParseBoolFromEnv(common.EnvEnableGRPCTimeHistogramEnv, false)
 }
 
 // ArgoCDServer is the API server for Argo CD
@@ -202,7 +204,9 @@ type ArgoCDServerOpts struct {
 	Insecure              bool
 	StaticAssetsDir       string
 	ListenPort            int
+	ListenHost            string
 	MetricsPort           int
+	MetricsHost           string
 	Namespace             string
 	DexServerAddr         string
 	DexTLSConfig          *dex.DexTLSConfig
@@ -216,7 +220,6 @@ type ArgoCDServerOpts struct {
 	TLSConfigCustomizer   tlsutil.ConfigCustomizer
 	XFrameOptions         string
 	ContentSecurityPolicy string
-	ListenHost            string
 	ApplicationNamespaces []string
 	EnableProxyExtension  bool
 }
@@ -290,7 +293,9 @@ func NewServer(ctx context.Context, opts ArgoCDServerOpts) *ArgoCDServer {
 
 	apiFactory := api.NewFactory(settings_notif.GetFactorySettings(argocdService, "argocd-notifications-secret", "argocd-notifications-cm"), opts.Namespace, secretInformer, configMapInformer)
 
-	return &ArgoCDServer{
+	dbInstance := db.NewDB(opts.Namespace, settingsMgr, opts.KubeClientset)
+
+	a := &ArgoCDServer{
 		ArgoCDServerOpts:  opts,
 		log:               log.NewEntry(log.StandardLogger()),
 		settings:          settings,
@@ -306,11 +311,19 @@ func NewServer(ctx context.Context, opts ArgoCDServerOpts) *ArgoCDServer {
 		policyEnforcer:    policyEnf,
 		userStateStorage:  userStateStorage,
 		staticAssets:      http.FS(staticFS),
-		db:                db.NewDB(opts.Namespace, settingsMgr, opts.KubeClientset),
+		db:                dbInstance,
 		apiFactory:        apiFactory,
 		secretInformer:    secretInformer,
 		configMapInformer: configMapInformer,
 	}
+
+	err = a.logInClusterWarnings()
+	if err != nil {
+		// Just log. It's not critical.
+		log.Warnf("Failed to log in-cluster warnings: %v", err)
+	}
+
+	return a
 }
 
 const (
@@ -353,6 +366,47 @@ func (l *Listeners) Close() error {
 			return err
 		}
 		l.GatewayConn = nil
+	}
+	return nil
+}
+
+// logInClusterWarnings checks the in-cluster configuration and prints out any warnings.
+func (a *ArgoCDServer) logInClusterWarnings() error {
+	labelSelector := labels.NewSelector()
+	req, err := labels.NewRequirement(common.LabelKeySecretType, selection.Equals, []string{common.LabelValueSecretTypeCluster})
+	if err != nil {
+		return fmt.Errorf("failed to construct cluster-type label selector: %w", err)
+	}
+	labelSelector = labelSelector.Add(*req)
+	secretsLister, err := a.settingsMgr.GetSecretsLister()
+	if err != nil {
+		return fmt.Errorf("failed to get secrets lister: %w", err)
+	}
+	clusterSecrets, err := secretsLister.Secrets(a.ArgoCDServerOpts.Namespace).List(labelSelector)
+	if err != nil {
+		return fmt.Errorf("failed to list cluster secrets: %w", err)
+	}
+	var inClusterSecrets []string
+	for _, clusterSecret := range clusterSecrets {
+		cluster, err := db.SecretToCluster(clusterSecret)
+		if err != nil {
+			return fmt.Errorf("could not unmarshal cluster secret %q: %w", clusterSecret.Name, err)
+		}
+		if cluster.Server == v1alpha1.KubernetesInternalAPIServerAddr {
+			inClusterSecrets = append(inClusterSecrets, clusterSecret.Name)
+		}
+	}
+	if len(inClusterSecrets) > 0 {
+		// Don't make this call unless we actually have in-cluster secrets, to save time.
+		dbSettings, err := a.settingsMgr.GetSettings()
+		if err != nil {
+			return fmt.Errorf("could not get DB settings: %w", err)
+		}
+		if !dbSettings.InClusterEnabled {
+			for _, clusterName := range inClusterSecrets {
+				log.Warnf("cluster %q uses in-cluster server address but it's disabled in Argo CD settings", clusterName)
+			}
+		}
 	}
 	return nil
 }
@@ -447,7 +501,7 @@ func (a *ArgoCDServer) Run(ctx context.Context, listeners *Listeners) {
 		httpsS.Handler = &bug21955Workaround{handler: httpsS.Handler}
 	}
 
-	metricsServ := metrics.NewMetricsServer(a.ListenHost, a.MetricsPort)
+	metricsServ := metrics.NewMetricsServer(a.MetricsHost, a.MetricsPort)
 	if a.RedisClient != nil {
 		cacheutil.CollectMetrics(a.RedisClient, metricsServ)
 	}
@@ -779,7 +833,21 @@ func newArgoCDServiceSet(a *ArgoCDServer) *ArgoCDServiceSet {
 		a.projInformer,
 		a.ApplicationNamespaces)
 
-	applicationSetService := applicationset.NewServer(a.db, a.KubeClientset, a.enf, a.Cache, a.AppClientset, a.appLister, a.appsetInformer, a.appsetLister, a.projLister, a.settingsMgr, a.Namespace, projectLock)
+	applicationSetService := applicationset.NewServer(
+		a.db,
+		a.KubeClientset,
+		a.enf,
+		a.Cache,
+		a.AppClientset,
+		a.appLister,
+		a.appsetInformer,
+		a.appsetLister,
+		a.projLister,
+		a.settingsMgr,
+		a.Namespace,
+		projectLock,
+		a.ApplicationNamespaces)
+
 	projectService := project.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.enf, projectLock, a.sessionMgr, a.policyEnforcer, a.projInformer, a.settingsMgr, a.db)
 	appsInAnyNamespaceEnabled := len(a.ArgoCDServerOpts.ApplicationNamespaces) > 0
 	settingsService := settings.NewServer(a.settingsMgr, a.RepoClientset, a, a.DisableAuth, appsInAnyNamespaceEnabled)
